@@ -1,0 +1,10 @@
+[Unit]
+Description=Westly weekly plan, Sundays 17:00
+
+[Timer]
+OnCalendar=Sun *-*-* 17:00:00
+Unit=westly-run@weekly.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

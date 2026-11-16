@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""westly-doc — put a file or link on the Docs shelf in the phone app and print its link.
+
+  westly-doc add FILE [--title T] [--source BOX] [--quiet]
+  westly-doc add - --name NAME [--title T] [--source BOX]   bytes on stdin (e.g. piped over ssh
+                                                             from another machine)
+  westly-doc add --url URL --title T [--source BOX]
+  westly-doc list
+  westly-doc rm ID
+
+Links open only on the owner's tailnet (PUBLIC_URL in westly.env). A feed note says what landed.
+"""
+import argparse
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+VENV = REPO / ".venv"
+if (VENV / "bin" / "python").exists() and Path(sys.prefix).resolve() != VENV.resolve():
+    os.execv(str(VENV / "bin" / "python"), [str(VENV / "bin" / "python"), *sys.argv])  # pda needs aiohttp
+sys.path.insert(0, str(REPO))
+import config  # noqa: E402
+import pda  # noqa: E402
+
+
+def link(d):
+    path = f"/doc/{d['id']}"
+    return config.PUBLIC_URL + path if config.PUBLIC_URL else f"{path} (set PUBLIC_URL in westly.env for a full link)"
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="westly-doc", description="Westly Docs shelf")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("add")
+    a.add_argument("file", nargs="?")
+    a.add_argument("--url", default="")
+    a.add_argument("--title", default="")
+    a.add_argument("--name", default="")
+    a.add_argument("--source", default=socket.gethostname())
+    a.add_argument("--quiet", action="store_true", help="no feed note (a batch writes one note itself)")
+    sub.add_parser("list")
+    r = sub.add_parser("rm")
+    r.add_argument("id")
+    args = ap.parse_args(argv)
+
+    if args.cmd == "list":
+        for d in pda.docs_list():
+            print(f"{d['id']}  {time.strftime('%m/%d %H:%M', time.localtime(d['added']))}  {d['kind']:5}  "
+                  f"{d['title']}  ({d['source']})")
+        return 0
+    if args.cmd == "rm":
+        if not pda.doc_set_removed(args.id, True):
+            print(f"westly-doc: no doc {args.id}", file=sys.stderr)
+            return 1
+        print(f"removed {args.id} (restorable from the app for {pda.DOC_TRASH_DAYS} days)")
+        return 0
+
+    try:
+        if args.url:
+            d = pda.doc_add(args.title, args.source, url=args.url)
+        elif args.file == "-":
+            if not args.name:
+                ap.error("stdin needs --name (the original filename, for its type)")
+            d = pda.doc_add(args.title, args.source, sys.stdin.buffer.read(pda.DOC_MAX + 1), args.name)
+        elif args.file:
+            p = Path(args.file)
+            if not p.is_file():
+                ap.error(f"no such file: {p}")
+            if p.stat().st_size > pda.DOC_MAX:
+                ap.error(f"{p.name} is over {pda.DOC_MAX // (1024 * 1024)} MB")
+            d = pda.doc_add(args.title or p.stem, args.source, p.read_bytes(), p.name)
+        else:
+            ap.error("give a FILE, - with --name, or --url")
+    except ValueError as e:
+        print(f"westly-doc: {e}", file=sys.stderr)
+        return 1
+    if not args.quiet:
+        pda.SENT.parent.mkdir(parents=True, exist_ok=True)
+        (pda.SENT.parent / f"docs-{d['id']}.md").write_text(f"New on your Docs shelf: {d['title']}\n{link(d)}\n")
+    print(link(d))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

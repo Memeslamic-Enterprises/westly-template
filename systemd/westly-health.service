@@ -1,0 +1,9 @@
+[Unit]
+Description=Westly health check (feed note only on change; pings only when urgent)
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO@
+EnvironmentFile=-@REPO@/westly.env
+ExecStart=@REPO@/.venv/bin/python @REPO@/bin/westly-health
+TimeoutStartSec=120

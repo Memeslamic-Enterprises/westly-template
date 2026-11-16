@@ -1,0 +1,10 @@
+[Unit]
+Description=Westly evening review, daily 21:30
+
+[Timer]
+OnCalendar=*-*-* 21:30:00
+Unit=westly-run@evening.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

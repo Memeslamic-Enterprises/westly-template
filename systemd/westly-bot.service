@@ -1,0 +1,16 @@
+[Unit]
+Description=Westly chat gateway + phone app (westly_bot.py)
+After=network-online.target
+Wants=network-online.target
+OnFailure=westly-alert@%n.service
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+EnvironmentFile=-@REPO@/westly.env
+ExecStart=@REPO@/.venv/bin/python @REPO@/westly_bot.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target

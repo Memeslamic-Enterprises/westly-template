@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# westly-run <task> — one fresh-session headless run of prompts/<task>.md (systemd: westly-run@<task>)
+set -uo pipefail
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+CLAUDE="${CLAUDE_BIN:-claude}"
+
+fail_msg() {  # fail_msg <stdout> <stderr-file> <rc>: what a failed run leaves in the log
+    if [ -n "$1$(cat "$2")" ]; then { printf '%s\n' "$1"; cat "$2"; } | tail -c 1500
+    else echo "claude produced no output (rc=$3)"; fi
+}
+if [ "${1:-}" = "--selftest" ]; then  # offline: fixtures only, never starts claude
+    e=$(mktemp); trap 'rm -f "$e"' EXIT
+    [ "$(fail_msg '' "$e" 7)" = "claude produced no output (rc=7)" ] || { echo "FAIL: empty run"; exit 1; }
+    printf 'stderr line\n' > "$e"
+    [ "$(fail_msg '{"result":"Failed to authenticate"}' "$e" 1)" = $'{"result":"Failed to authenticate"}\nstderr line' ] ||
+        { echo "FAIL: stdout + stderr"; exit 1; }
+    [ "$(fail_msg "$(printf 'x%.0s' $(seq 3000))" "$e" 1 | wc -c)" -le 1500 ] || { echo "FAIL: 1500-byte cap"; exit 1; }
+    echo PASS; exit 0
+fi
+
+TASK="${1:?usage: westly-run <task>}"
+case "$TASK" in *[!a-z0-9_-]*) echo "westly-run: bad task name: $TASK"; exit 1;; esac
+PROMPT="$REPO/prompts/$TASK.md"
+# failures exit 1: OnFailure=westly-alert@ files a feed note, westly-health pings if it repeats
+[ -f "$PROMPT" ] || { echo "westly-run: no prompt file for task $TASK"; exit 1; }
+cd "$REPO"
+echo "westly-run $TASK  claude=$("$CLAUDE" --version 2>/dev/null)"
+
+exec 9>"$REPO/.claude-run.lock"
+flock -w 600 9 || { echo "westly-run: $TASK skipped, lock held >10m"; exit 1; }
+
+run_claude() {  # stderr kept apart: the API-key run warns there, and stdout must stay pure JSON
+    out=$(timeout 840 "$CLAUDE" -p "$(cat "$PROMPT")" \
+            --model "${WESTLY_MODEL:-sonnet}" --fallback-model haiku \
+            --permission-mode bypassPermissions \
+            --setting-sources project,local --add-dir "$REPO" \
+            --output-format json 2>"$ERR"); rc=$?
+}
+ERR=$(mktemp); trap 'rm -f "$ERR"' EXIT
+run_ok() { printf '%s' "$out" | python3 -c '
+import json,sys
+try: print("0" if not json.load(sys.stdin).get("is_error") else "1")
+except Exception: print("1")'; }
+run_claude
+ok=$(run_ok)
+# only a FAILED run is read for these markers: a good result may mention logins or limits itself
+expired=0; limited=0
+AUTH_FLAG="$REPO/.auth-expired"
+if [ "$rc" -eq 0 ] && [ "$ok" = "0" ]; then
+    rm -f "$AUTH_FLAG"
+elif printf '%s\n%s' "$out" "$(cat "$ERR")" | grep -qiE 'failed to authenticate|oauth session expired|oauth token has expired|not logged in|please run /login'; then
+    expired=1  # same markers as pda.AUTH_MARKERS; westly-health pings on the flag
+    [ -e "$AUTH_FLAG" ] || date -Iminutes > "$AUTH_FLAG"
+elif printf '%s' "$out" | grep -qiE 'hit your (session|usage) limit|usage limit reached'; then
+    limited=1
+fi
+# Max meter exhausted or login expired: rerun the task on the API key
+if [ -n "${WESTLY_API_KEY:-}" ] && [ "$expired$limited" != "00" ]; then
+    echo "westly-run: $([ "$expired" = 1 ] && echo 'login expired' || echo 'Max limit hit'), retrying on API key"
+    ANTHROPIC_API_KEY="$WESTLY_API_KEY" run_claude
+    ok=$(run_ok)
+fi
+
+if [ "$rc" -ne 0 ] || [ "$ok" != "0" ]; then
+    msg=$(fail_msg "$out" "$ERR" "$rc")
+    # print from bash and linger: journald files a line under its writer's live cgroup, and lines
+    # from an already-exited pipe stage end up under no unit at all
+    printf '%s\n' "$msg"; sleep 2
+    exit 1
+fi
+printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("result","")[:400])'

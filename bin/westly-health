@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Westly health — report anything sus, and report it fixed when it clears.
+
+Deterministic, no LLM. Probes the units, the optional "hands" (HEALTH_SSH_HOSTS,
+Home Assistant), the attention log and the assistant's own freshness, then diffs the
+findings against the last run. A feed note (the app) goes out ONLY when the set
+changes: new problems under "Needs a look", cleared ones under "Fixed". Pings
+(bin/westly-ping) are kept for the few problems the owner has to act on: the bot
+down, scheduled runs dead, the Claude login expired, or one unit failing 3x in 24h.
+
+Run modes:
+  westly-health             probe, diff, feed note on change, ping if urgent
+  westly-health --report    probe and print everything, send nothing (manual check)
+  westly-health --selftest  assert-based checks of the pure logic, offline
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+import config  # noqa: E402
+
+NAME = config.ASSISTANT_NAME
+STATE = REPO / ".health.json"
+OUTBOX = REPO / "memory" / "outbox"
+JOURNAL = REPO / "memory" / "journal"
+ATTENTION = REPO / ".attention.log"
+AUTH_FLAG = REPO / ".auth-expired"
+UNITS = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user"
+TZ = config.TZ
+
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6"]
+PING = REPO / "bin" / "westly-ping"
+REPEAT_FAILS = 3       # a unit failing this often in 24h is broken, not blipping
+FLOOD_MIN = 5          # identical attention flags in 24h that mean "root cause unfixed"
+OUTBOX_STUCK = 900     # an outbox file older than this means the bot isn't draining
+JOURNAL_STALE = 36 * 3600
+
+
+# ---------- pure logic (selftested) ----------
+
+def parse_failures(log_text):
+    """journalctl text -> {key: line} for unit failures worth a look, with a count."""
+    counts = {}
+    for ln in log_text.splitlines():
+        m = re.search(r"(westly-[\w@.-]+?)\.service: Failed with result '([\w-]+)'", ln)
+        if m:
+            counts[m.groups()] = counts.get(m.groups(), 0) + 1
+    return {f"unit:{u}:{r}": f"{u} failed ({r})" + (f" {n}x in 24h" if n > 1 else "")
+            for (u, r), n in counts.items()}
+
+
+def parse_flood(log_text, now, window=86400, threshold=FLOOD_MIN):
+    """Attention lines repeating within the window — a monitor nobody fixed."""
+    counts = {}
+    for ln in log_text.splitlines():
+        ts, _, msg = ln.partition("\t")
+        if not msg:
+            continue
+        try:
+            when = datetime.fromisoformat(ts).timestamp()
+        except ValueError:
+            continue
+        if when >= now - window:
+            counts[msg.strip()] = counts.get(msg.strip(), 0) + 1
+    return {f"flood:{m}": f"{n}x in 24h — \"{m}\" (root cause still open)"
+            for m, n in counts.items() if n >= threshold}
+
+
+def transition(prev_seen, reported, findings):
+    """Decide what to DM. A problem must show up on TWO consecutive runs before it
+    is reported — a tunnel or SSH hop that blips once would otherwise DM twice
+    (down, then back up). Clearing is instant: one clean run closes it.
+
+    Returns (newly broken lines, newly cleared lines, still-open map)."""
+    broke = {k: v for k, v in findings.items() if k in prev_seen and k not in reported}
+    fixed = [reported[k] for k in sorted(reported) if k not in findings]
+    still = {k: v for k, v in reported.items() if k in findings}
+    still.update(broke)
+    return [broke[k] for k in sorted(broke)], fixed, still
+
+
+def urgent(key, line):
+    """Worth interrupting the owner for: the assistant can't reach them or can't work without help."""
+    if key in ("down:westly-bot", "stale:journal", "auth:expired"):
+        return True
+    m = re.search(r" (\d+)x in 24h$", line)
+    return key.startswith("unit:") and bool(m) and int(m.group(1)) >= REPEAT_FAILS
+
+
+def due_pings(still, findings, pinged):
+    """Open problems to ping about now: urgent on their CURRENT line (a failure count
+    grows after the first report) and not pinged since they opened."""
+    return [k for k in sorted(still) if k not in pinged and urgent(k, findings[k])]
+
+
+AUTH_FIX = (f"{NAME}'s Claude login expired, so chats and scheduled runs are failing (or using the backup"
+            " API key, if one is set). To fix: on the server, run `claude` in a terminal, type /login and"
+            " follow the link.")
+
+
+def ping_line(lines, limit=2):
+    """One phone-plain line; the detail lives in the app's feed. The expired login gets
+    its own fix-it line: replying 'look into it' can't work while chat is dead."""
+    if any(ln.startswith("Claude login expired") for ln in lines):
+        return AUTH_FIX
+    head = "; ".join(lines[:limit]) + (f" (+{len(lines) - limit} more)" if len(lines) > limit else "")
+    return (f"{NAME} needs a fix: {head}. Reply 'look into it' and I'll dig in, "
+            "or open the app → Feed for details.")
+
+
+def ping(lines):
+    """Ping via bin/westly-ping (Telegram, SMS fallback). The feed note can't carry these
+    alone: half of them mean the bot that files the feed is down."""
+    if not lines:
+        return False
+    try:
+        return subprocess.run([str(PING), ping_line(lines)], timeout=60).returncode == 0
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"health: ping failed: {e}", file=sys.stderr)
+        return False
+
+
+def compose(broke, fixed, now):
+    lines = [f"Health check — {now:%b %-d %-I:%M %p}"]
+    if broke:
+        lines += ["", "Needs a look:"] + [f"- {b}" for b in broke]
+    if fixed:
+        lines += ["", "Fixed since last check:"] + [f"- {f}" for f in fixed]
+    return "\n".join(lines) + "\n"
+
+
+def age_findings(now, journal_mtime, stuck_outbox):
+    """Freshness problems: the assistant gone quiet, outbox files stuck."""
+    out = {}
+    if journal_mtime and now - journal_mtime > JOURNAL_STALE:
+        hrs = int((now - journal_mtime) // 3600)
+        out["stale:journal"] = f"no journal entry in {hrs}h — scheduled runs may be dead"
+    for name in sorted(stuck_outbox):
+        out[f"stuck:{name}"] = f"outbox file {name} unfiled >15min — is westly-bot up?"
+    return out
+
+
+# ---------- probes (network / system) ----------
+
+def _ok(argv, timeout=12):
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=timeout).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _http_ok(url, headers):
+    """The token stays out of argv (and so out of `ps`)."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8) as r:
+            return r.status < 400
+    except Exception:
+        return False
+
+
+def probe_hands():
+    """Optional: each HEALTH_SSH_HOSTS entry (user@host, comma-separated) and Home Assistant."""
+    hands = {}
+    for host in (h.strip() for h in config.get("HEALTH_SSH_HOSTS").split(",")):
+        if re.fullmatch(r"[\w.-]+@[\w.-]+", host):
+            hands[f"{host} (ssh)"] = lambda host=host: _ok([*SSH, host, "true"])
+    ha, tok = config.get("HA_URL").rstrip("/"), config.get("HA_TOKEN")
+    if ha and tok:
+        hands["Home Assistant"] = lambda: _http_ok(f"{ha}/api/", {"Authorization": f"Bearer {tok}"})
+    return {f"down:{name}": f"{name} unreachable" for name, probe in hands.items() if not probe()}
+
+
+def probe_bot():
+    r = subprocess.run(["systemctl", "--user", "is-active", "westly-bot.service"],
+                       capture_output=True, text=True)
+    state = r.stdout.strip()
+    return {} if state == "active" else {
+        "down:westly-bot": f"westly-bot is {state or 'unknown'} — chat, the app and the feed are offline"}
+
+
+def probe_timers():
+    """A timer unit sitting on disk but not enabled never fires — silent death."""
+    out = {}
+    for unit in sorted(UNITS.glob("westly-*.timer")):
+        r = subprocess.run(["systemctl", "--user", "is-enabled", unit.name],
+                           capture_output=True, text=True)
+        if r.stdout.strip() != "enabled":
+            out[f"timer:{unit.name}"] = f"{unit.name} is not enabled — it never fires"
+    return out
+
+
+def probe_units(now):
+    r = subprocess.run(["journalctl", "--user", "-u", "westly-*", "--since", "-24h",
+                        "--no-pager"], capture_output=True, text=True)
+    return parse_failures(r.stdout)
+
+
+def probe_attention(now):
+    if not ATTENTION.exists():
+        return {}
+    return parse_flood(ATTENTION.read_text(errors="replace"), now)
+
+
+def probe_age(now):
+    journals = sorted(JOURNAL.glob("*.md")) if JOURNAL.exists() else []
+    jm = max((p.stat().st_mtime for p in journals), default=0)
+    stuck = [p.name for p in OUTBOX.glob("*.md")
+             if p.is_file() and now - p.stat().st_mtime > OUTBOX_STUCK]
+    return age_findings(now, jm, stuck)
+
+
+def probe_auth(now):
+    """bin/westly-run and chat drop this flag when the subscription login fails."""
+    if not AUTH_FLAG.exists():
+        return {}
+    since = AUTH_FLAG.read_text(errors="replace").strip()[:16].replace("T", " ")
+    return {"auth:expired": f"Claude login expired (first seen {since}) — runs use the backup API key"}
+
+
+def collect(now):
+    findings = {}
+    findings.update(probe_auth(now))
+    for probe in (probe_units, probe_attention, probe_age):
+        findings.update(probe(now))
+    findings.update(probe_hands())
+    findings.update(probe_timers())
+    findings.update(probe_bot())
+    return findings
+
+
+def main(report_only=False):
+    now = datetime.now(TZ)
+    findings = collect(now.timestamp())
+
+    if report_only:
+        print(json.dumps(findings, indent=2) if findings else "all clear")
+        return 0
+
+    try:
+        state = json.loads(STATE.read_text())
+        prev_seen, reported = state.get("seen", {}), state.get("reported", {})
+        pinged = set(state.get("pinged", reported))  # pre-ping state: open = already told
+    except (OSError, ValueError, AttributeError):
+        prev_seen, reported, pinged = {}, {}, set()
+
+    broke, fixed, still = transition(prev_seen, reported, findings)
+    due = due_pings(still, findings, pinged)
+    if due and ping([findings[k] for k in due]):
+        pinged |= set(due)
+    pinged &= set(still)  # a cleared problem may ping again if it comes back
+    STATE.write_text(json.dumps({"seen": findings, "reported": still,
+                                 "pinged": sorted(pinged)}, indent=2))
+
+    if not broke and not fixed:
+        print(f"health: no change ({len(still)} open, {len(findings)} seen)")
+        return 0
+
+    OUTBOX.mkdir(parents=True, exist_ok=True)
+    (OUTBOX / f"health-{now:%Y%m%d-%H%M%S}.md").write_text(compose(broke, fixed, now))
+    print(f"health: {len(broke)} new, {len(fixed)} fixed — feed note written"
+          + (f", pinged {len(due)}" if due else ""))
+    return 0
+
+
+def selftest():
+    now = 1_700_000_000
+
+    # parse_failures: picks the unit + result, dedupes repeats of the same failure
+    log = ("Aug 17 12:01:03 box systemd[1]: westly-briefcheck.service: "
+           "Failed with result 'timeout'.\n"
+           "Aug 17 12:01:03 box systemd[1]: Failed to start westly-briefcheck.service"
+           " - Westly daily-brief scheduler check.\n"
+           "Aug 17 12:05:00 box systemd[1]: westly-briefcheck.service: "
+           "Failed with result 'timeout'.\n"
+           "Aug 17 13:00:00 box systemd[1]: westly-run@mail.service: "
+           "Failed with result 'exit-code'.\n"
+           "Aug 17 14:00:00 box westly[9]: everything fine here\n")
+    f = parse_failures(log)
+    assert set(f) == {"unit:westly-briefcheck:timeout", "unit:westly-run@mail:exit-code"}, f
+    assert f["unit:westly-run@mail:exit-code"] == "westly-run@mail failed (exit-code)"
+    assert f["unit:westly-briefcheck:timeout"] == "westly-briefcheck failed (timeout) 2x in 24h"
+    assert parse_failures("nothing to see") == {}
+
+    # urgent: only what the owner must act on; a single or double failure stays in the feed
+    storm = parse_failures("westly-bot.service: Failed with result 'exit-code'\n" * 147)
+    assert urgent("unit:westly-bot:exit-code", storm["unit:westly-bot:exit-code"])
+    assert not urgent("unit:westly-briefcheck:timeout", f["unit:westly-briefcheck:timeout"])
+    assert not urgent("unit:westly-run@mail:exit-code", f["unit:westly-run@mail:exit-code"])
+    assert urgent("down:westly-bot", "x") and urgent("stale:journal", "x")
+    assert not urgent("down:me@nas (ssh)", "me@nas (ssh) unreachable")
+    assert not urgent("flood:x", "6x in 24h — \"x\" (root cause still open)")
+    # due_pings: judged on the live count, once per open problem
+    k = "unit:westly-run@mail:exit-code"
+    still = {k: "westly-run@mail failed (exit-code) 2x in 24h"}
+    assert due_pings(still, still, set()) == []
+    now3 = {k: "westly-run@mail failed (exit-code) 3x in 24h"}
+    assert due_pings(still, now3, set()) == [k]       # crossed the line after being reported
+    assert due_pings(still, now3, {k}) == []           # already pinged for this episode
+    line = ping_line(["a", "b", "c"])
+    assert line.startswith(f"{NAME} needs a fix: a; b (+1 more).") and "the app" in line, line
+    assert urgent("auth:expired", "x") and ping_line(["Claude login expired (first seen x)", "b"]) == AUTH_FIX
+
+    # parse_flood: only repeats inside the window count; unparseable lines ignored
+    def line(hours_ago, msg):
+        ts = datetime.fromtimestamp(now - hours_ago * 3600, TZ).isoformat()
+        return f"{ts}\t{msg}"
+    flood_log = "\n".join(
+        [line(h, "storefront CRITICAL: 503") for h in range(6)]
+        + [line(2, "one-off blip"), line(30, "storefront CRITICAL: 503"),
+           "garbage line with no tab", "not-a-date\tmsg"])
+    fl = parse_flood(flood_log, now)
+    assert list(fl) == ["flood:storefront CRITICAL: 503"], fl
+    assert fl["flood:storefront CRITICAL: 503"].startswith("6x in 24h"), fl
+    # 4 repeats is under threshold -> silent
+    assert parse_flood("\n".join(line(h, "quiet") for h in range(4)), now) == {}
+
+    # transition: a one-run blip never reports; the second sighting does
+    blip = {"x": "X down"}
+    broke, fixed, still = transition({}, {}, blip)
+    assert (broke, fixed, still) == ([], [], {}), (broke, fixed, still)
+    broke, fixed, still = transition(blip, {}, blip)
+    assert broke == ["X down"] and fixed == [] and still == blip, (broke, fixed, still)
+    # already reported and still failing -> silent, stays open
+    broke, fixed, still = transition(blip, blip, blip)
+    assert (broke, fixed, still) == ([], [], blip), (broke, fixed, still)
+    # cleared on one good run -> reported fixed once, then forgotten
+    broke, fixed, still = transition(blip, blip, {})
+    assert broke == [] and fixed == ["X down"] and still == {}, (broke, fixed, still)
+    broke, fixed, still = transition({}, {}, {})
+    assert (broke, fixed, still) == ([], [], {})
+    # multiple new problems report in stable key order
+    two = {"a": "A down", "b": "B down"}
+    assert transition(two, {}, two)[0] == ["A down", "B down"]
+
+    # age_findings: thresholds, and "no data" never fires a false alarm
+    a = age_findings(now, now - 40 * 3600, ["brief-x.md"])
+    assert set(a) == {"stale:journal", "stuck:brief-x.md"} and "40h" in a["stale:journal"], a
+    assert age_findings(now, now - 3600, []) == {}
+    assert age_findings(now, 0, []) == {}
+
+    # compose: only the sections that have content, never an empty DM
+    msg = compose(["X down"], ["Y back"], datetime(2026, 8, 17, 21, 5, tzinfo=TZ))
+    assert "Needs a look:\n- X down" in msg and "Fixed since last check:\n- Y back" in msg, msg
+    assert "Needs a look" not in compose([], ["Y back"], datetime.now(TZ))
+    assert "Fixed" not in compose(["X down"], [], datetime.now(TZ))
+
+    print("PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "--selftest":
+        sys.exit(selftest())
+    sys.exit(main(report_only=(arg == "--report")))

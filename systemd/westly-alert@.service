@@ -1,0 +1,6 @@
+[Unit]
+Description=Westly failure note for %i (feed only; westly-health pings if it persists)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'mkdir -p @REPO@/memory/outbox && echo "⚠️ @ASSISTANT@: %i failed" > @REPO@/memory/outbox/attn-$$(date +%%s%%N).md'

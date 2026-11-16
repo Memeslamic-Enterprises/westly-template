@@ -1,0 +1,10 @@
+[Unit]
+Description=Westly mail triage, 4x daily (optional: needs MAIL_* in westly.env)
+
+[Timer]
+OnCalendar=*-*-* 09,12,17,21:20:00
+Unit=westly-run@mail.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Westly scheduled run: prompts/%i.md
+After=network-online.target
+OnFailure=westly-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO@
+EnvironmentFile=-@REPO@/westly.env
+ExecStart=@REPO@/bin/westly-run %i
+TimeoutStartSec=900

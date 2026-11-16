@@ -1,0 +1,10 @@
+[Unit]
+Description=Westly morning-brief scheduler check
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO@
+EnvironmentFile=-@REPO@/westly.env
+ExecStart=@REPO@/.venv/bin/python @REPO@/brief_scheduler.py
+TimeoutStartSec=60
