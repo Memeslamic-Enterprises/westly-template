@@ -1,0 +1,37 @@
+# secrets and per-install settings
+westly.env
+westly.env.*
+!westly.env.example
+gcal-sa.json
+*.save
+*.swp
+*~
+
+# runtime state
+.venv/
+__pycache__/
+*.pyc
+.session
+.owner
+.claude-run.lock
+.brief_triggered.json
+.mail-scan.json
+.health.json
+.attention.log
+.auth-expired
+.ping_sent.json
+.sms_sent.json
+.tg_offset.json
+.gcal-token.json
+.pda.sock
+.pda-chat.json
+.pda-chat.tmp
+memory/.needs.lock
+memory/.*.tmp
+memory/mail/
+memory/outbox/*
+!memory/outbox/.gitkeep
+!memory/outbox/sent/
+memory/outbox/sent/*
+!memory/outbox/sent/.gitkeep
+docs-shelf/
